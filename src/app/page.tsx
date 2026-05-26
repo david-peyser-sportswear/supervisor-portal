@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { supervisorClient } from "@/lib/rpc-client";
+import { UserButton } from "@clerk/nextjs";
 
 // Local types for the dashboard UI
 interface ExecutionLog {
@@ -274,24 +275,27 @@ export default function SupervisorDashboard() {
           </div>
         </div>
 
-        {/* Server Connection Status */}
-        <div className="connection-pill">
-          {checkingConnection ? (
-            <>
-              <div className="connection-dot pulsing" style={{ backgroundColor: "#94a3b8" }} />
-              <span>Verifying Connection...</span>
-            </>
-          ) : isBackendOnline ? (
-            <>
-              <div className="connection-dot liveness pulsing" />
-              <span style={{ color: "#4ade80" }}>Connect-RPC Backend Online</span>
-            </>
-          ) : (
-            <>
-              <div className="connection-dot offline pulsing" />
-              <span style={{ color: "#f87171" }}>Offline Sandbox Simulator</span>
-            </>
-          )}
+        {/* Auth and Server Connection Status */}
+        <div style={{ display: "flex", alignItems: "center", gap: "1.25rem" }}>
+          <div className="connection-pill">
+            {checkingConnection ? (
+              <>
+                <div className="connection-dot pulsing" style={{ backgroundColor: "#94a3b8" }} />
+                <span>Verifying Connection...</span>
+              </>
+            ) : isBackendOnline ? (
+              <>
+                <div className="connection-dot liveness pulsing" />
+                <span style={{ color: "#4ade80" }}>Connect-RPC Backend Online</span>
+              </>
+            ) : (
+              <>
+                <div className="connection-dot offline pulsing" />
+                <span style={{ color: "#f87171" }}>Offline Sandbox Simulator</span>
+              </>
+            )}
+          </div>
+          <UserButton />
         </div>
       </header>
 
