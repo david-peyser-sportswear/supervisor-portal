@@ -65,7 +65,7 @@ export default function SupervisorDashboard() {
       setConnectionError(null);
 
       // Verify connection by getting queue depth
-      const qDepth = await supervisorClient.getQueueDepth({ queueName: "logiwa-unpublished" });
+      const qDepth = await supervisorClient.getQueueDepth({ queueName: "a2000-logiwa-unpublished" });
       setA2000QueueDepth(qDepth.pendingCount);
       setIsBackendOnline(true);
 
@@ -173,7 +173,7 @@ export default function SupervisorDashboard() {
           { timestamp: nowTime(), type: "info", message: `Output: ${response.outputJson || "{}"}` },
         ]);
         // Refresh values
-        const qDepth = await supervisorClient.getQueueDepth({ queueName: "logiwa-unpublished" });
+        const qDepth = await supervisorClient.getQueueDepth({ queueName: "a2000-logiwa-unpublished" });
         setA2000QueueDepth(qDepth.pendingCount);
         setA2000Liveness(100);
         setA2000LastComplete("Just now");
