@@ -18,6 +18,23 @@ interface InvocRecord {
   duration: string;
 }
 
+// MVDev distinguishes three names for the same flow:
+//   - REGISTER_CONTROLLER name (camelCase) is the runController-RPC registry key.
+//   - REGISTER_CRON_JOB name (kebab-case) is what gets written to
+//     `invocations.controller_name` (and `pings.cron_name + "-default"`).
+// These are NOT the same string. The portal must use each in the right slot.
+const A2000 = {
+  invocationsControllerName: "update-a2000-pick-tickets-from-logiwa",
+  pingTaskName: "update-a2000-pick-tickets-from-logiwa-default",
+  runControllerName: "updateA2000PickTicketsFromLogiwa",
+  unpublishedQueue: "a2000-logiwa-unpublished",
+} as const;
+const APPAMAN = {
+  invocationsControllerName: "pushAmPickTicketToShipmonk",
+  pingTaskName: "shipmonk-sync-default",
+  runControllerName: "shipmonk-sync",
+} as const;
+
 export default function SupervisorDashboard() {
   // Connection states
   const [isBackendOnline, setIsBackendOnline] = useState<boolean>(false);
@@ -33,11 +50,11 @@ export default function SupervisorDashboard() {
   const [a2000ConsoleLogs, setA2000ConsoleLogs] = useState<ExecutionLog[]>([]);
 
   // Apparel Magic <> Shipmonk State
-  const [appamanSuccessRatio, setAppamanSuccessRatio] = useState<string>("0%");
-  const [shipmonkQueued, setShipmonkQueued] = useState<number>(0);
-  const [shipmonkUnable, setShipmonkUnable] = useState<number>(0);
-  const [shipmonkAction, setShipmonkAction] = useState<number>(0);
-  const [isHeapHealthy, setIsHeapHealthy] = useState<boolean>(true);
+  // Initial "—" + null heart-health avoids the old 0%-ring / 100%-text mismatch
+  // while waiting for the first ping/invocations response.
+  const [appamanSuccessRatio, setAppamanSuccessRatio] = useState<string>("—");
+  const [appamanLastComplete, setAppamanLastComplete] = useState<string>("Never");
+  const [isHeapHealthy, setIsHeapHealthy] = useState<boolean | null>(null);
   const [runningAppaman, setRunningAppaman] = useState<boolean>(false);
   const [appamanHistory, setAppamanHistory] = useState<InvocRecord[]>([]);
   const [appamanConsoleLogs, setAppamanConsoleLogs] = useState<ExecutionLog[]>([]);
@@ -64,88 +81,88 @@ export default function SupervisorDashboard() {
       setCheckingConnection(true);
       setConnectionError(null);
 
-      // Verify connection by getting queue depth
-      const qDepth = await supervisorClient.getQueueDepth({ queueName: "a2000-logiwa-unpublished" });
+      const qDepth = await supervisorClient.getQueueDepth({ queueName: A2000.unpublishedQueue });
       setA2000QueueDepth(qDepth.pendingCount);
       setIsBackendOnline(true);
 
-      // Fetch liveness and heartbeats
-      try {
-        const pings = await supervisorClient.getPings({});
-        if (pings && pings.pings) {
-          // Find updateA2000PickTicketsFromLogiwa ping
-          const a2000Ping = pings.pings.find(p => p.taskName === "updateA2000PickTicketsFromLogiwa");
-          if (a2000Ping) {
-            setA2000LastComplete(a2000Ping.timestamp ? new Date(a2000Ping.timestamp).toLocaleTimeString() : "Never");
-            setA2000Liveness(a2000Ping.pingType === "complete" || a2000Ping.pingType === "success" ? 100 : 0);
-          } else {
-            setA2000Liveness(100);
-          }
-
-          const amPing = pings.pings.find(p => p.taskName === "syncShipmonkAmPickTicketsAppaman");
-          if (amPing) {
-            setAppamanSuccessRatio(amPing.pingType === "complete" || amPing.pingType === "success" ? "100%" : "0%");
-            setIsHeapHealthy(amPing.pingType !== "fail");
-          } else {
-            setAppamanSuccessRatio("100%");
-            setIsHeapHealthy(true);
-          }
+      // GetPings takes a single required task_name — one call per panel.
+      const applyPing = (
+        ping: { pingType: string; timestamp: string } | undefined,
+        setLast: (s: string) => void,
+        setHealthy: (b: boolean) => void,
+      ) => {
+        if (!ping) {
+          setLast("Never");
+          setHealthy(false);
+          return;
         }
-      } catch (pingErr) {
-        console.warn("Could not load controller heartbeat signals", pingErr);
-      }
+        setLast(ping.timestamp ? new Date(ping.timestamp).toLocaleTimeString() : "Never");
+        setHealthy(ping.pingType === "complete" || ping.pingType === "success");
+      };
 
-      // Fetch Recent Executions
-      try {
-        const fetchInvocationsForController = async (controllerName: string): Promise<InvocRecord[]> => {
-          try {
-            const res = await supervisorClient.getInvocations({ controllerName });
-            if (res && res.invocations) {
-              return res.invocations.map((inv) => {
-                const dateStr = inv.startTime 
-                  ? new Date(inv.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                  : "Unknown";
+      const fetchLatestPing = async (taskName: string) => {
+        try {
+          const res = await supervisorClient.getPings({ taskName, limit: 1 });
+          return res?.pings?.[0];
+        } catch (err) {
+          console.warn(`Could not load ${taskName} heartbeat`, err);
+          return undefined;
+        }
+      };
 
-                let durationStr = "Unknown";
-                if (inv.startTime && inv.endTime) {
-                  try {
-                    const diff = new Date(inv.endTime).getTime() - new Date(inv.startTime).getTime();
-                    if (diff >= 0) {
-                      durationStr = `${(diff / 1000).toFixed(1)}s`;
-                    }
-                  } catch {}
-                }
+      const [a2000Ping, amPing] = await Promise.all([
+        fetchLatestPing(A2000.pingTaskName),
+        fetchLatestPing(APPAMAN.pingTaskName),
+      ]);
+      applyPing(a2000Ping, setA2000LastComplete, (h) => setA2000Liveness(h ? 100 : 0));
+      applyPing(amPing, setAppamanLastComplete, setIsHeapHealthy);
 
-                return {
-                  id: inv.id,
-                  controllerName: inv.controllerName,
-                  time: dateStr,
-                  success: inv.success,
-                  duration: durationStr,
-                };
-              });
-            }
-          } catch (err) {
-            console.error(`Failed to load invocations for ${controllerName}`, err);
-          }
+      // Recent invocations — fetched sequentially per controller (parallel calls
+      // were observed to trip Connect validation on the gateway during boot).
+      const toInvocRecord = (inv: { id: string; controllerName: string; startTime: string; endTime: string; success: boolean }): InvocRecord => {
+        const time = inv.startTime
+          ? new Date(inv.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : "Unknown";
+        let duration = "Unknown";
+        if (inv.startTime && inv.endTime) {
+          const diff = new Date(inv.endTime).getTime() - new Date(inv.startTime).getTime();
+          if (!Number.isNaN(diff) && diff >= 0) duration = `${(diff / 1000).toFixed(1)}s`;
+        }
+        return { id: inv.id, controllerName: inv.controllerName, time, success: inv.success, duration };
+      };
+
+      const fetchInvocationsForController = async (controllerName: string): Promise<InvocRecord[]> => {
+        try {
+          const res = await supervisorClient.getInvocations({ controllerName, limit: 10 });
+          return (res?.invocations ?? []).map(toInvocRecord);
+        } catch (err) {
+          console.error(`Failed to load invocations for ${controllerName}`, err);
           return [];
-        };
+        }
+      };
 
-        const [a2000List, appamanList] = await Promise.all([
-          fetchInvocationsForController("updateA2000PickTicketsFromLogiwa"),
-          fetchInvocationsForController("syncShipmonkAmPickTicketsAppaman")
-        ]);
+      const a2000List = await fetchInvocationsForController(A2000.invocationsControllerName);
+      const appamanList = await fetchInvocationsForController(APPAMAN.invocationsControllerName);
+      setA2000History(a2000List.slice(0, 5));
+      setAppamanHistory(appamanList.slice(0, 5));
 
-        setA2000History(a2000List.slice(0, 5));
-        setAppamanHistory(appamanList.slice(0, 5));
-      } catch (historyErr) {
-        console.error("Failed to load invocation list history", historyErr);
+      // 24h success ratio for the AM panel computed from invocations, not a
+      // single ping. Falls back to "—" if we have no recent activity.
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const recent = appamanList.filter((i) => {
+        const t = new Date(i.time).getTime();
+        return Number.isNaN(t) ? true : t >= oneDayAgo;
+      });
+      if (recent.length > 0) {
+        const ok = recent.filter((i) => i.success).length;
+        setAppamanSuccessRatio(`${Math.round((ok / recent.length) * 100)}%`);
+      } else {
+        setAppamanSuccessRatio("—");
       }
-
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Connection attempt to Connect-RPC server failed:", err);
       setIsBackendOnline(false);
-      setConnectionError(err.message || String(err));
+      setConnectionError(err instanceof Error ? err.message : String(err));
     } finally {
       setCheckingConnection(false);
     }
@@ -164,10 +181,10 @@ export default function SupervisorDashboard() {
 
     try {
       const response = await supervisorClient.runController({
-        controllerName: "updateA2000PickTicketsFromLogiwa",
-        payloadJson: JSON.stringify({ manualTrigger: true }),
+        controllerName: A2000.runControllerName,
+        payloadJson: JSON.stringify({}),
       });
-      
+
       if (response.success) {
         setA2000ConsoleLogs(prev => [
           ...prev,
@@ -175,8 +192,7 @@ export default function SupervisorDashboard() {
           { timestamp: nowTime(), type: "success", message: "A2000 sync run complete!" },
           { timestamp: nowTime(), type: "info", message: `Output: ${response.outputJson || "{}"}` },
         ]);
-        // Refresh values
-        const qDepth = await supervisorClient.getQueueDepth({ queueName: "a2000-logiwa-unpublished" });
+        const qDepth = await supervisorClient.getQueueDepth({ queueName: A2000.unpublishedQueue });
         setA2000QueueDepth(qDepth.pendingCount);
         setA2000Liveness(100);
         setA2000LastComplete("Just now");
@@ -205,8 +221,8 @@ export default function SupervisorDashboard() {
 
     try {
       const response = await supervisorClient.runController({
-        controllerName: "syncShipmonkAmPickTicketsAppaman",
-        payloadJson: JSON.stringify({ forceSync: true }),
+        controllerName: APPAMAN.runControllerName,
+        payloadJson: JSON.stringify({}),
       });
 
       if (response.success) {
@@ -216,7 +232,8 @@ export default function SupervisorDashboard() {
           { timestamp: nowTime(), type: "success", message: "Apparel Magic sync run complete!" },
           { timestamp: nowTime(), type: "info", message: `Output: ${response.outputJson || "{}"}` },
         ]);
-        setAppamanSuccessRatio("100%");
+        setIsHeapHealthy(true);
+        setAppamanLastComplete("Just now");
       } else {
         setAppamanConsoleLogs(prev => [
           ...prev,
@@ -379,7 +396,7 @@ export default function SupervisorDashboard() {
                   <span>Running Sync Job...</span>
                 </>
               ) : (
-                <span>Run updateA2000PickTicketsFromLogiwa</span>
+                <span>Run {A2000.runControllerName}</span>
               )}
             </button>
 
@@ -436,20 +453,24 @@ export default function SupervisorDashboard() {
                 <svg width="64" height="64" viewBox="0 0 64 64">
                   <circle className="status-circle-bg" cx="32" cy="32" r="28" />
                   <circle
-                    className={`status-circle-bar ${isHeapHealthy ? "green" : "red"}`}
+                    className={`status-circle-bar ${isHeapHealthy === null ? "" : isHeapHealthy ? "green" : "red"}`}
                     cx="32"
                     cy="32"
                     r="28"
                     strokeDasharray={2 * Math.PI * 28}
-                    strokeDashoffset={0}
+                    strokeDashoffset={isHeapHealthy === null ? 2 * Math.PI * 28 : 0}
                   />
                 </svg>
                 <div className="status-text-inside">{appamanSuccessRatio}</div>
               </div>
               <div className="heartbeat-details">
-                <span className="heartbeat-label">24h Liveness Success Ratio</span>
-                <span className={`heartbeat-value ${isHeapHealthy ? "green" : "red"}`}>
-                  {isHeapHealthy ? "Telemetry Healthy (100% liveness)" : "Telemetry Stale / Degraded"}
+                <span className="heartbeat-label">24h Push Success Ratio</span>
+                <span className={`heartbeat-value ${isHeapHealthy === null ? "" : isHeapHealthy ? "green" : "red"}`}>
+                  {isHeapHealthy === null
+                    ? "Waiting for heartbeat..."
+                    : isHeapHealthy
+                      ? `Last ping: ${appamanLastComplete}`
+                      : `Stale / Degraded (last: ${appamanLastComplete})`}
                 </span>
               </div>
             </div>
@@ -457,27 +478,26 @@ export default function SupervisorDashboard() {
             {/* Metric grid */}
             <div className="metrics-grid">
               <div className="metric-box">
-                <span className="metric-box-title">Submission States</span>
-                <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-                  <span className="badge" style={{ background: "rgba(59,130,246,0.1)", color: "var(--color-blue)" }}>
-                    {shipmonkQueued} Queued
+                <span className="metric-box-title">Push Outcomes (24h)</span>
+                <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+                  <span className="badge success">
+                    {appamanHistory.filter((i) => i.success).length} Success
                   </span>
-                  <span className="badge" style={{ background: "rgba(239,68,68,0.1)", color: "var(--color-red)" }}>
-                    {shipmonkUnable} Failed
-                  </span>
-                  <span className="badge" style={{ background: "rgba(245,158,11,0.1)", color: "var(--color-amber)" }}>
-                    {shipmonkAction} Warning
+                  <span className="badge failed">
+                    {appamanHistory.filter((i) => !i.success).length} Failed
                   </span>
                 </div>
-                <span className="metric-box-sub" style={{ marginTop: "0.25rem" }}>Buffered orders</span>
+                <span className="metric-box-sub" style={{ marginTop: "0.25rem" }}>
+                  Recent {APPAMAN.invocationsControllerName} invocations
+                </span>
               </div>
 
               <div className="metric-box">
-                <span className="metric-box-title">OOM Crash Guard</span>
-                <span className="metric-box-value" style={{ color: isHeapHealthy ? "var(--color-green)" : "var(--color-red)" }}>
-                  {isHeapHealthy ? "HEALTHY" : "DEGRADED"}
+                <span className="metric-box-title">Parent Cron</span>
+                <span className="metric-box-value" style={{ fontSize: "1.05rem" }}>
+                  {APPAMAN.pingTaskName.replace(/-default$/, "")}
                 </span>
-                <span className="metric-box-sub">V8 heap container status</span>
+                <span className="metric-box-sub">Hourly ETL controller</span>
               </div>
             </div>
 
@@ -489,7 +509,7 @@ export default function SupervisorDashboard() {
                   <span>Running Sync Job...</span>
                 </>
               ) : (
-                <span>Run syncShipmonkAmPickTicketsAppaman</span>
+                <span>Run {APPAMAN.runControllerName}</span>
               )}
             </button>
 
