@@ -172,79 +172,166 @@ export default function SupervisorDashboard() {
     testConnectionAndFetchData();
   }, []);
 
-  // Handler to manually trigger A2000 <> Logiwa Sync
+  // Fire the RunController RPC and watch for completion. The cron-style
+  // controllers exposed here (~10 min duration) always exceed the CloudFront
+  // origin-response timeout (~30s) in front of foundry, so the browser sees a
+  // CORS-style failure even though the controller ran to completion on the
+  // server. We race the RPC against that timeout: fast paths (sub-30s success
+  // or validation error) settle directly; slow paths fall through to polling
+  // GetInvocations, which the supervisor framework writes on controller end.
+  //
+  // RunController writes the invocations.controller_name as the exact string
+  // passed in — so we poll under the same `runControllerName` we dispatched
+  // with, not the cron's kebab name.
+  const runWithPoll = async (params: {
+    runControllerName: string;
+    appendLog: (entry: ExecutionLog) => void;
+    onComplete?: (success: boolean) => void;
+  }) => {
+    const { runControllerName, appendLog, onComplete } = params;
+    const clickedAt = new Date().toISOString();
+    let resolved = false;
+
+    const runPromise = supervisorClient
+      .runController({ controllerName: runControllerName, payloadJson: "{}" })
+      .then((response) => ({ kind: "ok" as const, response }))
+      .catch((err: unknown) => ({ kind: "err" as const, err }));
+
+    // Phase 1: race the RPC against ~25s. CloudFront cuts at 30s, so anything
+    // settling under 25s is a real server response.
+    const FAST_PATH_MS = 25_000;
+    const fastPath = await Promise.race([
+      runPromise,
+      new Promise<{ kind: "timeout" }>((r) => setTimeout(() => r({ kind: "timeout" }), FAST_PATH_MS)),
+    ]);
+
+    if (fastPath.kind === "ok") {
+      resolved = true;
+      const r = fastPath.response;
+      if (r.success) {
+        appendLog({ timestamp: nowTime(), type: "info", message: `Invocation registered: ${r.invocationId}` });
+        appendLog({ timestamp: nowTime(), type: "success", message: "Run complete." });
+        if (r.outputJson) appendLog({ timestamp: nowTime(), type: "info", message: `Output: ${r.outputJson}` });
+      } else {
+        appendLog({ timestamp: nowTime(), type: "error", message: `Run failed: ${r.errorMessage || "(no error message)"}` });
+      }
+      onComplete?.(r.success);
+      return;
+    }
+
+    if (fastPath.kind === "err") {
+      // Sub-25s network/validation failure — surface it directly. (Long-running
+      // controllers don't reach this branch; their failures arrive via the
+      // timeout path below.)
+      resolved = true;
+      const msg = fastPath.err instanceof Error ? fastPath.err.message : String(fastPath.err);
+      appendLog({ timestamp: nowTime(), type: "error", message: `Dispatch failed: ${msg}` });
+      onComplete?.(false);
+      return;
+    }
+
+    // Phase 2: timeout path. The controller is still running on foundry; the
+    // browser just can't read the response. Drop the in-flight promise on the
+    // floor (its eventual settle is silently ignored) and poll GetInvocations.
+    runPromise.then(() => {
+      // suppress late settles after we've moved to polling
+    });
+    appendLog({
+      timestamp: nowTime(),
+      type: "info",
+      message: "Gateway response timed out (expected for long-running crons). Polling supervisor for completion...",
+    });
+
+    const POLL_MS = 5_000;
+    const MAX_MS = 20 * 60 * 1000;
+    const startedAt = Date.now();
+    let lastPollLogTimestamp = "";
+
+    while (!resolved && Date.now() - startedAt < MAX_MS) {
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      try {
+        const res = await supervisorClient.getInvocations({
+          controllerName: runControllerName,
+          startTimeAfter: clickedAt,
+          limit: 1,
+        });
+        if (res.invocations.length > 0) {
+          resolved = true;
+          const inv = res.invocations[0];
+          let duration = "?";
+          if (inv.startTime && inv.endTime) {
+            const diff = new Date(inv.endTime).getTime() - new Date(inv.startTime).getTime();
+            if (!Number.isNaN(diff) && diff >= 0) duration = `${(diff / 1000).toFixed(1)}s`;
+          }
+          appendLog({
+            timestamp: nowTime(),
+            type: inv.success ? "success" : "error",
+            message: `${inv.success ? "Completed" : "Failed"} ${inv.id} (duration ${duration})`,
+          });
+          if (!inv.success && inv.errorMessage) {
+            appendLog({ timestamp: nowTime(), type: "error", message: inv.errorMessage });
+          }
+          onComplete?.(inv.success);
+          return;
+        }
+      } catch {
+        // poll-side network blip; continue
+      }
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      lastPollLogTimestamp = nowTime();
+      appendLog({ timestamp: lastPollLogTimestamp, type: "info", message: `Polling for completion... (${elapsed}s elapsed)` });
+    }
+
+    if (!resolved) {
+      appendLog({
+        timestamp: nowTime(),
+        type: "warn",
+        message: "Stopped polling after 20 min. Run may still be in progress — check Recent Run History later.",
+      });
+    }
+  };
+
   const handleRunA2000Sync = async () => {
     if (runningA2000 || !isBackendOnline) return;
     setRunningA2000(true);
-    
     setA2000ConsoleLogs([{ timestamp: nowTime(), type: "info", message: "Dispatching execution trigger to A2000 controller..." }]);
-
     try {
-      const response = await supervisorClient.runController({
-        controllerName: A2000.runControllerName,
-        payloadJson: JSON.stringify({}),
+      await runWithPoll({
+        runControllerName: A2000.runControllerName,
+        appendLog: (e) => setA2000ConsoleLogs((prev) => [...prev, e]),
+        onComplete: async (success) => {
+          if (success) {
+            try {
+              const qDepth = await supervisorClient.getQueueDepth({ queueName: A2000.unpublishedQueue });
+              setA2000QueueDepth(qDepth.pendingCount);
+              setA2000Liveness(100);
+              setA2000LastComplete("Just now");
+            } catch {
+              // ignore refresh failure
+            }
+          }
+        },
       });
-
-      if (response.success) {
-        setA2000ConsoleLogs(prev => [
-          ...prev,
-          { timestamp: nowTime(), type: "info", message: `Invocation registered: ${response.invocationId}` },
-          { timestamp: nowTime(), type: "success", message: "A2000 sync run complete!" },
-          { timestamp: nowTime(), type: "info", message: `Output: ${response.outputJson || "{}"}` },
-        ]);
-        const qDepth = await supervisorClient.getQueueDepth({ queueName: A2000.unpublishedQueue });
-        setA2000QueueDepth(qDepth.pendingCount);
-        setA2000Liveness(100);
-        setA2000LastComplete("Just now");
-      } else {
-        setA2000ConsoleLogs(prev => [
-          ...prev,
-          { timestamp: nowTime(), type: "error", message: `Execution Failed: ${response.errorMessage}` }
-        ]);
-      }
-    } catch (err: any) {
-      setA2000ConsoleLogs(prev => [
-        ...prev,
-        { timestamp: nowTime(), type: "error", message: `RPC Network Exception: ${err.message || err}` }
-      ]);
     } finally {
       setRunningA2000(false);
     }
   };
 
-  // Handler to manually trigger Apparel Magic <> Shipmonk Sync
   const handleRunAppamanSync = async () => {
     if (runningAppaman || !isBackendOnline) return;
     setRunningAppaman(true);
-
     setAppamanConsoleLogs([{ timestamp: nowTime(), type: "info", message: "Dispatching execution trigger to Apparel Magic controller..." }]);
-
     try {
-      const response = await supervisorClient.runController({
-        controllerName: APPAMAN.runControllerName,
-        payloadJson: JSON.stringify({}),
+      await runWithPoll({
+        runControllerName: APPAMAN.runControllerName,
+        appendLog: (e) => setAppamanConsoleLogs((prev) => [...prev, e]),
+        onComplete: (success) => {
+          if (success) {
+            setIsHeapHealthy(true);
+            setAppamanLastComplete("Just now");
+          }
+        },
       });
-
-      if (response.success) {
-        setAppamanConsoleLogs(prev => [
-          ...prev,
-          { timestamp: nowTime(), type: "info", message: `Invocation registered: ${response.invocationId}` },
-          { timestamp: nowTime(), type: "success", message: "Apparel Magic sync run complete!" },
-          { timestamp: nowTime(), type: "info", message: `Output: ${response.outputJson || "{}"}` },
-        ]);
-        setIsHeapHealthy(true);
-        setAppamanLastComplete("Just now");
-      } else {
-        setAppamanConsoleLogs(prev => [
-          ...prev,
-          { timestamp: nowTime(), type: "error", message: `Execution Failed: ${response.errorMessage}` }
-        ]);
-      }
-    } catch (err: any) {
-      setAppamanConsoleLogs(prev => [
-        ...prev,
-        { timestamp: nowTime(), type: "error", message: `RPC Network Exception: ${err.message || err}` }
-      ]);
     } finally {
       setRunningAppaman(false);
     }
