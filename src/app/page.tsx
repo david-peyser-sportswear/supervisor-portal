@@ -97,44 +97,47 @@ export default function SupervisorDashboard() {
 
       // Fetch Recent Executions
       try {
-        const response = await supervisorClient.getInvocations({});
-        if (response && response.invocations) {
-          const mappedA2000: InvocRecord[] = [];
-          const mappedAppaman: InvocRecord[] = [];
+        const fetchInvocationsForController = async (controllerName: string): Promise<InvocRecord[]> => {
+          try {
+            const res = await supervisorClient.getInvocations({ controllerName });
+            if (res && res.invocations) {
+              return res.invocations.map((inv) => {
+                const dateStr = inv.startTime 
+                  ? new Date(inv.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  : "Unknown";
 
-          response.invocations.forEach((inv) => {
-            const dateStr = inv.startTime 
-              ? new Date(inv.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-              : "Unknown";
-
-            let durationStr = "Unknown";
-            if (inv.startTime && inv.endTime) {
-              try {
-                const diff = new Date(inv.endTime).getTime() - new Date(inv.startTime).getTime();
-                if (diff >= 0) {
-                  durationStr = `${(diff / 1000).toFixed(1)}s`;
+                let durationStr = "Unknown";
+                if (inv.startTime && inv.endTime) {
+                  try {
+                    const diff = new Date(inv.endTime).getTime() - new Date(inv.startTime).getTime();
+                    if (diff >= 0) {
+                      durationStr = `${(diff / 1000).toFixed(1)}s`;
+                    }
+                  } catch {}
                 }
-              } catch {}
+
+                return {
+                  id: inv.id,
+                  controllerName: inv.controllerName,
+                  time: dateStr,
+                  success: inv.success,
+                  duration: durationStr,
+                };
+              });
             }
+          } catch (err) {
+            console.error(`Failed to load invocations for ${controllerName}`, err);
+          }
+          return [];
+        };
 
-            const record: InvocRecord = {
-              id: inv.id,
-              controllerName: inv.controllerName,
-              time: dateStr,
-              success: inv.success,
-              duration: durationStr,
-            };
+        const [a2000List, appamanList] = await Promise.all([
+          fetchInvocationsForController("updateA2000PickTicketsFromLogiwa"),
+          fetchInvocationsForController("syncShipmonkAmPickTicketsAppaman")
+        ]);
 
-            if (inv.controllerName === "updateA2000PickTicketsFromLogiwa") {
-              mappedA2000.push(record);
-            } else if (inv.controllerName === "syncShipmonkAmPickTicketsAppaman") {
-              mappedAppaman.push(record);
-            }
-          });
-
-          setA2000History(mappedA2000.slice(0, 5));
-          setAppamanHistory(mappedAppaman.slice(0, 5));
-        }
+        setA2000History(a2000List.slice(0, 5));
+        setAppamanHistory(appamanList.slice(0, 5));
       } catch (historyErr) {
         console.error("Failed to load invocation list history", historyErr);
       }
